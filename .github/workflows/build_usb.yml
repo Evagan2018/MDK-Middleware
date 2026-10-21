@@ -77,7 +77,7 @@ jobs:
          if not realgcc.is_file():raise RuntimeError('GCC artifact export does not resolve to a compiler')
          version=subprocess.check_output([str(realgcc),'-dumpfullversion'],text=True).strip()
          banner=subprocess.check_output([str(realgcc),'--version'],text=True).splitlines()[0]
-         info={'kind':'environment','artifact_version':TARGET,'artifact_export':'GCC_TOOLCHAIN_15_3_2','real_compiler':str(realgcc),'dumpfullversion':version,'compiler_banner':banner,'compiler_sha256':hashlib.sha256(realgcc.read_bytes()).hexdigest(),'version_verified':version==TARGET,'vcpkg_exports':{k:v for k,v in os.environ.items() if k.startswith('GCC_TOOLCHAIN_')}}
+         info={'kind':'environment','artifact_version':TARGET,'artifact_export':'GCC_TOOLCHAIN_15_3_2','real_compiler':str(realgcc),'dumpfullversion':version,'compiler_banner':banner,'compiler_sha256':hashlib.sha256(realgcc.read_bytes()).hexdigest(),'version_verified':version=='15.3.1' and bool(re.search(r'Arm GNU Toolchain 15\.3\.Rel2\b',banner)),'vcpkg_exports':{k:v for k,v in os.environ.items() if k.startswith('GCC_TOOLCHAIN_')}}
          realcbuild=shutil.which('cbuild')
          config={'compiler_bin':str(realgcc.parent),'cbuild':realcbuild,'environment':info}
          (HOME/'config.json').write_text(json.dumps(config))
@@ -97,7 +97,7 @@ jobs:
           for k in os.environ:
            if k.startswith('GCC_TOOLCHAIN_') and k not in ('GCC_TOOLCHAIN_15_3_2','GCC_TOOLCHAIN_ROOT'):f.write(k+'=\n')
          emit(info)
-         if not info['version_verified']:print('::warning::Artifact is labelled 15.3.2 but compiler banner reports '+version,flush=True)
+         if not info['version_verified']:print('::warning::Compiler identity does not match Arm GNU Toolchain 15.3.Rel2 (GCC 15.3.1)',flush=True)
         def wrapper(tool):
          cfg=json.loads((HOME/'config.json').read_text());args=sys.argv[1:];start=time.time()
          if tool=='cbuild':
