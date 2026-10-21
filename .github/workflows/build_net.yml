@@ -1,99 +1,173 @@
-name: Build - Network
-on:
-  workflow_dispatch:
-  pull_request:
-    paths:
-      - '.ci/Network/**'
-      - .github/workflows/build_net.yml
-      - .github/codeql-config.yml
-      - 'Examples/Network/**'
-      - 'Components/Network/**'
-  push:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+name: GCC 15.3.2 qualification / Build - Network
+'on':
+  workflow_dispatch: null
 env:
   TARGET_TYPE: CM4
   TARGET_DEVICE: ARMCM4
   TARGET_LAYER: $SolutionDir()$/../../.ci/Board/Board.clayer.yml
-
 jobs:
   Build:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [AC6, GCC]
-
+        include:
+        - compiler: GCC
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout MDK-Middleware
-        uses: actions/checkout@v7
+    - name: Checkout MDK-Middleware
+      uses: actions/checkout@v7
+      with:
+        repository: Evagan2018/MDK-Middleware
+        ref: gcc-15.3.2-qualification-20261021-133244
+    - name: Setup board layer
+      run: |
+        sed -i "s|target-types:|&\n    - type: $TARGET_TYPE\n      device: $TARGET_DEVICE\n      variables:\n      - Board-Layer: $TARGET_LAYER|" ./Examples/Network/Network.csolution.yml
+    - name: Cache packs
+      uses: actions/cache@v6
+      with:
+        key: cmsis-packs-${{ github.workflow }}-${{ hashFiles('**/*.csolution.yml', '**/*.cproject.yml', '**/*.clayer.yml') }}
+        restore-keys: |
+          cmsis-packs-${{ github.workflow }}-
+          cmsis-packs-
+        path: /home/runner/.cache/arm/packs
+    - name: Prepare vcpkg env
+      uses: ARM-software/cmsis-actions/vcpkg@v1
+      with:
+        config: .ci/vcpkg-configuration.json
+    - name: Initialize CMSIS pack root folder
+      run: |
+        cpackget init https://www.keil.com/pack/index.pidx
+        cpackget update-index
+    - name: Use local MDK-Middleware pack
+      run: |
+        cpackget rm Keil.MDK-Middleware || true
+        cpackget add Keil.MDK-Middleware.pdsc
+    - uses: ammaraskar/gcc-problem-matcher@master
+    - name: Install GCC 15.3.2 qualification probe
+      id: gcc_probe
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/gcc-15.3.2-qualification"
+        cat > "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" <<'GCC_PROBE_EOF'
+        #!/usr/bin/env python3
+        """GCC qualification instrumentation for Linux runners; standard library only."""
+        import hashlib,json,os,re,shutil,subprocess,sys,time,xml.etree.ElementTree as ET
+        from pathlib import Path
+        TARGET='15.3.2'
+        HOME=Path(os.environ.get('RUNNER_TEMP','.'))/'gcc-15.3.2-qualification'
+        WORKSPACE=Path(os.environ.get('GITHUB_WORKSPACE','.')).resolve()
+        SKIP={'.git','.packs','.Download','node_modules','boost_1_84_0'}
+        def emit(value,announce=True):
+         HOME.mkdir(parents=True,exist_ok=True)
+         with (HOME/'evidence.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(value)+'\n')
+         if announce:print('GCC_QUALIFICATION_RESULT '+json.dumps(value),flush=True)
+        def scan(suffix):
+         for base,dirs,names in os.walk(WORKSPACE):
+          dirs[:]=[d for d in dirs if d not in SKIP and not Path(base,d).is_symlink()]
+          for name in names:
+           if name.endswith(suffix):yield Path(base,name)
+        def install():
+         HOME.mkdir(parents=True,exist_ok=True);bindir=HOME/'bin';bindir.mkdir(exist_ok=True)
+         envpath=os.environ.get('GCC_TOOLCHAIN_15_3_2')
+         if not envpath:raise RuntimeError('Exact vcpkg GCC_TOOLCHAIN_15_3_2 export is missing')
+         realgcc=(Path(envpath)/'arm-none-eabi-gcc').resolve()
+         if not realgcc.is_file():raise RuntimeError('GCC artifact export does not resolve to a compiler')
+         version=subprocess.check_output([str(realgcc),'-dumpfullversion'],text=True).strip()
+         banner=subprocess.check_output([str(realgcc),'--version'],text=True).splitlines()[0]
+         info={'kind':'environment','artifact_version':TARGET,'artifact_export':'GCC_TOOLCHAIN_15_3_2','real_compiler':str(realgcc),'dumpfullversion':version,'compiler_banner':banner,'compiler_sha256':hashlib.sha256(realgcc.read_bytes()).hexdigest(),'version_verified':version==TARGET,'vcpkg_exports':{k:v for k,v in os.environ.items() if k.startswith('GCC_TOOLCHAIN_')}}
+         realcbuild=shutil.which('cbuild')
+         config={'compiler_bin':str(realgcc.parent),'cbuild':realcbuild,'environment':info}
+         (HOME/'config.json').write_text(json.dumps(config))
+         for f in realgcc.parent.iterdir():
+          dest=bindir/f.name
+          if not dest.exists():dest.symlink_to(f)
+         # Compiler invocations are retained as JSONL artifacts, not printed individually.
+         probe=Path(__file__).resolve()
+         for tool in ['arm-none-eabi-gcc','arm-none-eabi-g++','cbuild']:
+          if tool=='cbuild' and not realcbuild:continue
+          dest=bindir/tool
+          if dest.exists() or dest.is_symlink():dest.unlink()
+          dest.write_text('#!/usr/bin/env python3\nimport runpy,sys\nns=runpy.run_path('+repr(str(probe))+',run_name="gcc_probe")\nsys.exit(ns["wrapper"]('+repr(tool)+'))\n');dest.chmod(0o755)
+         with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bindir)+'\n')
+         with open(os.environ['GITHUB_ENV'],'a') as f:
+          f.write('GCC_TOOLCHAIN_15_3_2='+str(bindir)+'\nGCC_TOOLCHAIN_ROOT='+str(bindir)+'\n')
+          for k in os.environ:
+           if k.startswith('GCC_TOOLCHAIN_') and k not in ('GCC_TOOLCHAIN_15_3_2','GCC_TOOLCHAIN_ROOT'):f.write(k+'=\n')
+         emit(info)
+         if not info['version_verified']:print('::warning::Artifact is labelled 15.3.2 but compiler banner reports '+version,flush=True)
+        def wrapper(tool):
+         cfg=json.loads((HOME/'config.json').read_text());args=sys.argv[1:];start=time.time()
+         if tool=='cbuild':
+          real=cfg['cbuild'];isbuild=any('.csolution.' in a for a in args) and not any(a in args for a in ['setup','list','clean','--help','--version'])
+          if isbuild:
+           if '--toolchain' in args:
+            selected=args[args.index('--toolchain')+1]
+            if selected.split('@')[0].upper()!='GCC':raise RuntimeError('Non-GCC build reached qualification wrapper: '+selected)
+           else:args+=['--toolchain','GCC']
+          before={str(p):p.stat().st_mtime_ns for p in scan('.cbuild.yml')} if isbuild else {}
+          rc=subprocess.call([real]+args)
+          if isbuild:
+           metadata=[]
+           for p in scan('.cbuild.yml'):
+            if before.get(str(p))!=p.stat().st_mtime_ns:
+             text=p.read_text(encoding='utf-8-sig',errors='replace');comp=re.findall(r'^\s*compiler:\s*(.+)$',text,re.M);ctx=re.findall(r'^\s*context:\s*(.+)$',text,re.M)
+             metadata.append({'path':str(p.relative_to(WORKSPACE)),'compiler':comp,'context':ctx})
+           emit({'kind':'build','cwd':str(Path.cwd()),'arguments':args,'exit_code':rc,'duration_seconds':round(time.time()-start,2),'metadata':metadata,'compiler_version':cfg['environment']['dumpfullversion'],'version_verified':cfg['environment']['version_verified']})
+          return rc
+         real=str(Path(cfg['compiler_bin'])/tool);rc=subprocess.call([real]+args)
+         iscompile='-c' in args or '-S' in args or any(a.endswith(('.c','.cpp','.cc','.cxx','.s','.S')) for a in args)
+         if iscompile:emit({'kind':'compiler','tool':tool,'cwd':str(Path.cwd()),'arguments':args,'exit_code':rc,'version_verified':cfg['environment']['version_verified']},False)
+         return rc
+        def finish():
+         records=[json.loads(l) for l in (HOME/'evidence.jsonl').read_text().splitlines()] if (HOME/'evidence.jsonl').exists() else []
+         env=[r for r in records if r['kind']=='environment'];builds=[r for r in records if r['kind']=='build'];compiles=[r for r in records if r['kind']=='compiler']
+         xml=[]
+         for p in scan(('.xunit','.xml')):
+          if 'junit' not in p.name.lower() and not p.name.endswith('.xunit') and p.name!='lit.xml':continue
+          try:
+           root=ET.parse(p).getroot()
+           if root.tag not in ('testsuite','testsuites'):continue
+           failures=sum(1 for t in root.iter() if t.tag in ('failure','error'))
+           xml.append({'path':str(p.relative_to(WORKSPACE)),'failures_or_errors':failures})
+          except ET.ParseError:pass
+         result={'kind':'summary','artifact_version':TARGET,'compiler_versions':sorted({r['dumpfullversion'] for r in env}),'build_calls':len(builds),'failed_build_calls':sum(r['exit_code']!=0 for r in builds),'compiler_calls':len(compiles),'compiler_nonzero_calls':sum(r['exit_code']!=0 for r in compiles),'version_verified':bool(env) and all(r['version_verified'] for r in env),'xml_failure_records':sum(x['failures_or_errors']>0 for x in xml),'xml_reports':xml}
+         # Compiler nonzero calls are not automatically failures: LIT includes negative compile tests.
+         result['qualification_pass']=bool(compiles) and result['version_verified'] and not result['failed_build_calls'] and not result['xml_failure_records']
+         (HOME/'summary.json').write_text(json.dumps(result,indent=2));emit(result)
+         return 0 if result['qualification_pass'] else 1
+        if __name__=='__main__':
+         tool=Path(sys.argv[0]).name
+         if tool in ('cbuild','arm-none-eabi-gcc','arm-none-eabi-g++'):sys.exit(wrapper(tool))
+         if '--install' in sys.argv:install()
+         elif '--finish' in sys.argv:sys.exit(finish())
 
-      - name: Setup board layer
-        run: |
-          sed -i "s|target-types:|&\n    - type: $TARGET_TYPE\n      device: $TARGET_DEVICE\n      variables:\n      - Board-Layer: $TARGET_LAYER|" ./Examples/Network/Network.csolution.yml
-
-      - name: Cache packs
-        uses: actions/cache@v6
-        with:
-          key: cmsis-packs-${{ github.workflow }}-${{ hashFiles('**/*.csolution.yml', '**/*.cproject.yml', '**/*.clayer.yml') }}
-          restore-keys: |
-            cmsis-packs-${{ github.workflow }}-
-            cmsis-packs-
-          path: /home/runner/.cache/arm/packs
-
-      - name: Prepare vcpkg env
-        uses: ARM-software/cmsis-actions/vcpkg@v1
-        with:
-          config: .ci/vcpkg-configuration.json
-
-      - name: Initialize CMSIS pack root folder
-        run: |
-          cpackget init https://www.keil.com/pack/index.pidx
-          cpackget update-index
-
-      - name: Use local MDK-Middleware pack
-        run: |
-          cpackget rm Keil.MDK-Middleware || true
-          cpackget add Keil.MDK-Middleware.pdsc
-
-      - name: Activate Arm tool license
-        run: |
-          armlm activate --server https://mdk-preview.keil.arm.com --product KEMDK-COM0
-
-      - uses: ammaraskar/gcc-problem-matcher@master
-
-      - name: Initialize CodeQL
-        if: matrix.compiler == 'GCC'
-        uses: github/codeql-action/init@v4
-        with:
-          languages: cpp
-          queries: security-and-quality
-          build-mode: manual
-          trap-caching: false
-          config-file: .github/codeql-config.yml
-
-      - name: Build Network sources
-        if: always()
-        run: |
-          cbuild ./.ci/Library.csolution.yml --packs --update-rte --context Network --toolchain ${{ matrix.compiler }}
-
-      - name: Build Network examples
-        if: always()
-        run: |
-          cbuild ./Examples/Network/Network.csolution.yml --packs --update-rte --toolchain ${{ matrix.compiler }}
-
-      - name: Perform CodeQL Analysis
-        if: ${{ !cancelled() && matrix.compiler == 'GCC' }}
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: /component/network
-
-      - name: Deactivate Arm tool license
-        if: always()
-        run: |
-          armlm deactivate --product KEMDK-COM0
+        GCC_PROBE_EOF
+        python3 "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" --install
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+    - name: Build Network sources
+      if: ${{ !cancelled() && steps.gcc_probe.outputs.ready == 'true' && (always()) }}
+      run: |
+        cbuild ./.ci/Library.csolution.yml --packs --update-rte --context Network --toolchain ${{ matrix.compiler }}
+    - name: Build Network examples
+      if: ${{ !cancelled() && steps.gcc_probe.outputs.ready == 'true' && (always()) }}
+      run: |
+        cbuild ./Examples/Network/Network.csolution.yml --packs --update-rte --toolchain ${{ matrix.compiler }}
+    - name: Verify GCC 15.3.2 compilation evidence
+      if: always()
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: python3 "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" --finish
+    - name: Upload GCC qualification evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: gcc-qualification-${{ github.job }}-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/gcc-15.3.2-qualification/*.json*
+        if-no-files-found: warn
+        retention-days: 14
+    timeout-minutes: 120
+run-name: GCC 15.3.2 / build_net.yml / ${{ github.run_id }}
+permissions:
+  contents: read
